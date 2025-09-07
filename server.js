@@ -19,7 +19,7 @@ class ConnectFourGame {
     this.board[row][col] = this.currentPlayer;
     if (this.#checkWin(row, col)) this.winner = this.currentPlayer;
     else this.currentPlayer = this.currentPlayer === 'Player 1' ? 'Player 2' : 'Player 1';
-    return true;
+    return { row, col }; // return coordinates of the placed chip
   }
   #checkWin(r, c) {
     const P = this.board[r][c];
@@ -38,6 +38,19 @@ class ConnectFourGame {
   }
 }
 
+/* ---------- Color helpers ---------- */
+function normalizeColor(c) {
+  if (typeof c !== 'string') return null;
+  const s = c.trim();
+  return /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(s) ? s : null;
+}
+function pickAlternateColor(taken) {
+  const palette = ['#ef4444', '#3b82f6', '#22c55e', '#eab308', '#a855f7', '#f97316'];
+  const t = (taken || '').toLowerCase();
+  return palette.find(p => p.toLowerCase() !== t) || '#3b82f6';
+}
+
+/* ---------- Server setup ---------- */
 const PORT = process.env.PORT || 3001;
 const app = express();
 app.use(cors());
@@ -55,23 +68,16 @@ const wss = new WebSocket.Server({ server });
 
 let nextRoomId = 1;
 const waiting = new Set();
-const rooms = new Map();          // id -> { id, game, players:[wsA, wsB], rematch:Set<ws> }
-const state = new WeakMap();      // ws -> { alive, roomId?, playerNumber? }
-
+const rooms = new Map();
+const state = new WeakMap();
 const isOpen = ws => ws && ws.readyState === WebSocket.OPEN;
 
-/* ---------- helpers ---------- */
-function send(ws, obj)      { if (isOpen(ws)) try { ws.send(JSON.stringify(obj)); } catch {} }
-function lobby(ws, status)  { send(ws, { type:'lobby', status }); }
-
-function addToWaiting(ws){
-  if (!isOpen(ws)) return false;
-  waiting.add(ws);
-  lobby(ws, 'queued');                  // <— client expects type:'lobby'
-  return true;
-}
+/* ---------- Helpers ---------- */
+function addToWaiting(ws){ if (!isOpen(ws)) return false; waiting.add(ws); return true; }
 function takePair(){
-  const live = [...waiting].filter(isOpen);
+  // Purge closed sockets first
+  for (const ws of [...waiting]) if (!isOpen(ws)) waiting.delete(ws);
+  const live = [...waiting];
   if (live.length < 2) return null;
   const a = live[0], b = live.find(x => x !== a);
   if (!b) return null;
@@ -86,24 +92,32 @@ function createRoom(a,b, nameA=''){
   if (!isOpen(a)||!isOpen(b)||a===b) return;
   const id = nextRoomId++;
   const game = new ConnectFourGame();
-  const room = { id, game, players:[a,b], rematch: new Set() };
-  rooms.set(id, room);
-  state.set(a, { roomId:id, playerNumber:1, alive:true });
-  state.set(b, { roomId:id, playerNumber:2, alive:true });
 
-  // clear lobby states for both
-  lobby(a, 'idle'); lobby(b, 'idle');
+  const stA = state.get(a) || {};
+  const stB = state.get(b) || {};
 
-  send(a, { type:'startGame', currentPlayer:game.currentPlayer, playerNumber:1, username:nameA || '' });
-  send(b, { type:'startGame', currentPlayer:game.currentPlayer, playerNumber:2, username:'' });
+  // Resolve distinct colors from player preferences
+  let colA = normalizeColor(stA.desiredColor) || '#ef4444';
+  let colB = normalizeColor(stB.desiredColor) || '#3b82f6';
+  if (colB.toLowerCase() === colA.toLowerCase()) colB = pickAlternateColor(colA);
+
+  const colors = { 'Player 1': colA, 'Player 2': colB };
+
+  rooms.set(id, { id, game, players:[a,b], colors, rematchVotes: new Set() });
+
+  state.set(a, { ...stA, roomId:id, playerNumber:1, alive:true });
+  state.set(b, { ...stB, roomId:id, playerNumber:2, alive:true });
+
+  const startA = { type:'startGame', currentPlayer:game.currentPlayer, playerNumber:1, username: stA.username || '', colors };
+  const startB = { type:'startGame', currentPlayer:game.currentPlayer, playerNumber:2, username: stB.username || '', colors };
+  try{ a.send(JSON.stringify(startA)); }catch{}
+  try{ b.send(JSON.stringify(startB)); }catch{}
 }
 function destroyRoom(id){
   const room = rooms.get(id); if (!room) return;
   for (const ws of room.players) {
-    const st = state.get(ws);
-    if (st) { delete st.roomId; delete st.playerNumber; }
-    send(ws, { type:'end' });
-    lobby(ws, 'idle');
+    const st = state.get(ws); if (st) { delete st.roomId; delete st.playerNumber; }
+    try{ ws.send(JSON.stringify({ type:'end' })); }catch{}
   }
   rooms.delete(id);
 }
@@ -113,9 +127,8 @@ function disconnect(ws){
   if (st?.roomId){
     const room = rooms.get(st.roomId);
     if (room){
-      for (const other of room.players) if (other!==ws) {
-        send(other, { type:'opponentLeft' });
-        // do NOT auto-waitlist the opponent; let the client click Join
+      for (const other of room.players) if (other!==ws && isOpen(other)) {
+        try{ other.send(JSON.stringify({ type:'opponentLeft' })); }catch{}
       }
       destroyRoom(st.roomId);
     }
@@ -123,7 +136,7 @@ function disconnect(ws){
   state.delete(ws);
 }
 
-/* ---------- keepalive ---------- */
+/* ---------- Heartbeat + waiting purge ---------- */
 setInterval(() => {
   for (const ws of wss.clients) {
     const st = state.get(ws) || {};
@@ -131,9 +144,11 @@ setInterval(() => {
     st.alive = true; state.set(ws, st);
     try{ ws.ping(); }catch{}
   }
+  // keep waiting set clean
+  for (const ws of [...waiting]) if (!isOpen(ws)) waiting.delete(ws);
 }, 30000);
 
-/* ---------- websocket ---------- */
+/* ---------- Socket events ---------- */
 wss.on('connection', (ws) => {
   state.set(ws, { alive:true });
   ws.on('pong', () => { const st = state.get(ws); if (st) st.alive = true; });
@@ -143,76 +158,75 @@ wss.on('connection', (ws) => {
     const st = state.get(ws) || {};
 
     switch (data.type) {
-      /* --- queue / matchmaking --- */
       case 'joinGame': {
-        if (st.roomId) break;                  // already in a room
+        if (st.roomId) return;
+        const username = (data.username || '').slice(0, 40);
+        const color = normalizeColor(data.color) || null;
+        st.username = username;
+        st.desiredColor = color;
+        state.set(ws, st);
+
         addToWaiting(ws);
+        try{ ws.send(JSON.stringify({ type:'queued' })); }catch{}
         const pair = takePair();
-        if (pair) createRoom(pair[0], pair[1], data.username || '');
+        if (pair) createRoom(pair[0], pair[1], (pair[0]===ws?username:''));
         break;
       }
 
-      /* --- gameplay --- */
       case 'makeMove': {
-        if (!st.roomId) break;
-        const room = rooms.get(st.roomId); if (!room) break;
+        if (!st.roomId) return;
+        const room = rooms.get(st.roomId); if (!room) return;
         const sender = st.playerNumber === 1 ? 'Player 1' : 'Player 2';
-        if (room.game.currentPlayer !== sender) break;
-        const ok = room.game.makeMove(data.col);
-        if (ok) {
+        if (room.game.currentPlayer !== sender) return;
+        const result = room.game.makeMove(data.col);
+        if (result) {
           broadcast(room, {
             type:'gameUpdate',
             board: room.game.board,
             currentPlayer: room.game.currentPlayer,
-            winner: room.game.winner || null
+            winner: room.game.winner || null,
+            lastMove: result // {row,col}
           });
         }
         break;
       }
 
-      /* --- explicit leave (end for both, but sockets stay up) --- */
+      case 'resetGame': {
+        if (!st.roomId) return;
+        const room = rooms.get(st.roomId); if (!room) return;
+        room.game = new ConnectFourGame();
+        room.rematchVotes = new Set();
+        broadcast(room, { type:'resetAck' });
+        break;
+      }
+
+      /* ----- Simple rematch voting: 2/2 => new game ----- */
+      case 'rematchVote': {
+        if (!st.roomId) return;
+        const room = rooms.get(st.roomId); if (!room) return;
+        if (!room.rematchVotes) room.rematchVotes = new Set();
+        room.rematchVotes.add(st.playerNumber);
+        broadcast(room, { type:'rematchUpdate', count: room.rematchVotes.size });
+        if (room.rematchVotes.size >= 2) {
+          room.game = new ConnectFourGame();
+          room.rematchVotes = new Set();
+          broadcast(room, { type: 'rematchStart' });
+        }
+        break;
+      }
+
+      /* Graceful leave */
       case 'leaveGame': {
         waiting.delete(ws);
-        if (!st.roomId) { lobby(ws,'idle'); break; }
-        const room = rooms.get(st.roomId);
-        if (room) {
-          for (const other of room.players) if (other !== ws) {
-            send(other, { type:'opponentLeft' });
-            lobby(other, 'idle');
+        const s = state.get(ws);
+        if (s?.roomId) {
+          const room = rooms.get(s.roomId);
+          if (room) {
+            for (const other of room.players) if (other!==ws && isOpen(other)) {
+              try{ other.send(JSON.stringify({ type:'opponentLeft' })); }catch{}
+            }
+            destroyRoom(s.roomId);
           }
-          destroyRoom(st.roomId);
-        }
-        lobby(ws, 'idle');
-        break;
-      }
-
-      /* --- hard reset by button (optional) -> start a fresh game immediately --- */
-      case 'resetGame': {
-        if (!st.roomId) break;
-        const room = rooms.get(st.roomId); if (!room) break;
-        room.game = new ConnectFourGame();
-        room.rematch.clear();
-        // Tell clients we’re starting again (client will reset UI on this)
-        broadcast(room, { type:'rematchStart' });
-        break;
-      }
-
-      /* --- rematch voting (support multiple names from various clients) --- */
-      case 'rematch':
-      case 'rematchVote':
-      case 'requestRematch': {
-        if (!st.roomId) break;
-        const room = rooms.get(st.roomId); if (!room) break;
-
-        room.rematch.add(ws);
-        const votes = Math.min(2, room.rematch.size);
-        broadcast(room, { type:'rematchStatus', votes }); // 0/2, 1/2, 2/2
-
-        if (room.rematch.size >= 2) {
-          // both voted: new game instance
-          room.game = new ConnectFourGame();
-          room.rematch.clear();
-          broadcast(room, { type:'rematchStart' });
         }
         break;
       }
