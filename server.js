@@ -19,7 +19,7 @@ class ConnectFourGame {
     this.board[row][col] = this.currentPlayer;
     if (this.#checkWin(row, col)) this.winner = this.currentPlayer;
     else this.currentPlayer = this.currentPlayer === 'Player 1' ? 'Player 2' : 'Player 1';
-    return { row, col }; // return coordinates of the placed chip
+    return { row, col };
   }
   #checkWin(r, c) {
     const P = this.board[r][c];
@@ -45,7 +45,7 @@ function normalizeColor(c) {
   return /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(s) ? s : null;
 }
 function pickAlternateColor(taken) {
-  const palette = ['#ef4444', '#3b82f6', '#22c55e', '#eab308', '#a855f7', '#f97316', '#111827'];
+  const palette = ['#ef4444','#3b82f6','#22c55e','#eab308','#a855f7','#f97316','#111827','#6b7280'];
   const t = (taken || '').toLowerCase();
   return palette.find(p => p.toLowerCase() !== t) || '#3b82f6';
 }
@@ -83,13 +83,66 @@ function takePair(){
   waiting.delete(a); waiting.delete(b);
   return [a,b];
 }
+function send(ws, payload){ if (isOpen(ws)) { try{ ws.send(JSON.stringify(payload)); }catch{} } }
+function broadcast(room, payload){ for (const ws of room.players) send(ws, payload); }
 
-function broadcast(room, payload){
-  const msg = JSON.stringify(payload);
-  for (const ws of room.players) if (isOpen(ws)) { try{ ws.send(msg); }catch{} }
+/* ---------- Countdown lifecycle ---------- */
+function startCountdown(roomId){
+  const room = rooms.get(roomId);
+  if (!room) return;
+  room.countdownValue = 5;
+
+  // announce paired immediately
+  broadcast(room, { type:'paired', usernames: room.usernames, colors: room.colors });
+
+  // tick function
+  room.countdownTimer = setInterval(() => {
+    const r = rooms.get(roomId);
+    if (!r) return;
+    // if any player disconnected, cancel
+    const bothUp = r.players.every(isOpen);
+    if (!bothUp) { cancelCountdown(roomId, true); return; }
+
+    // broadcast current value and then decrement
+    sendCountdown(r);
+    r.countdownValue -= 1;
+
+    if (r.countdownValue <= 0) {
+      clearInterval(r.countdownTimer); r.countdownTimer = null;
+      // start the game
+      const start = {
+        type:'startGame',
+        currentPlayer: r.game.currentPlayer,
+        usernames: r.usernames,
+        colors: r.colors
+      };
+      const [a,b] = r.players;
+      send(a, { ...start, playerNumber:1 });
+      send(b, { ...start, playerNumber:2 });
+      r.countdownValue = null;
+    }
+  }, 1000);
+
+  // also send first tick right away (5)
+  sendCountdown(room);
+}
+function sendCountdown(room){
+  if (room.countdownValue == null) return;
+  broadcast(room, { type:'countdown', value: room.countdownValue });
+}
+function cancelCountdown(roomId, notifyOpponent){
+  const room = rooms.get(roomId);
+  if (!room) return;
+  if (room.countdownTimer) { clearInterval(room.countdownTimer); room.countdownTimer = null; }
+  room.countdownValue = null;
+  if (notifyOpponent) {
+    // tell remaining player their opponent left and end room
+    for (const ws of room.players) if (isOpen(ws)) send(ws, { type:'opponentLeft' });
+  }
+  destroyRoom(roomId);
 }
 
-/* ---------- NEW: paired preview then delayed start ---------- */
+/* ---------- Room ---------- */
 function createRoom(a,b){
   if (!isOpen(a)||!isOpen(b)||a===b) return;
   const id = nextRoomId++;
@@ -98,45 +151,31 @@ function createRoom(a,b){
   const stA = state.get(a) || {};
   const stB = state.get(b) || {};
 
+  // usernames
   const nameA = (stA.username || 'Player 1').toString().slice(0, 40) || 'Player 1';
   const nameB = (stB.username || 'Player 2').toString().slice(0, 40) || 'Player 2';
   const usernames = { 'Player 1': nameA, 'Player 2': nameB };
 
+  // colors (distinct)
   let colA = normalizeColor(stA.desiredColor) || '#ef4444';
   let colB = normalizeColor(stB.desiredColor) || '#3b82f6';
   if (colB.toLowerCase() === colA.toLowerCase()) colB = pickAlternateColor(colA);
   const colors = { 'Player 1': colA, 'Player 2': colB };
 
-  rooms.set(id, { id, game, players:[a,b], colors, rematchVotes: new Set(), usernames });
+  rooms.set(id, { id, game, players:[a,b], colors, usernames, rematchVotes: new Set(), countdownTimer: null, countdownValue: null });
 
   state.set(a, { ...stA, roomId:id, playerNumber:1, alive:true });
   state.set(b, { ...stB, roomId:id, playerNumber:2, alive:true });
 
-  // 1) Send a PAIRING PREVIEW with both names/colors so the UI can show opponent + countdown
-  const pairedPayload = { type:'paired', usernames, colors };
-  try{ a.send(JSON.stringify(pairedPayload)); }catch{}
-  try{ b.send(JSON.stringify(pairedPayload)); }catch{}
-
-  // 2) After 5 seconds, actually start the game
-  setTimeout(() => {
-    const room = rooms.get(id);
-    if (!room) return;
-    const start = {
-      type:'startGame',
-      currentPlayer: room.game.currentPlayer,
-      usernames: room.usernames,
-      colors: room.colors
-    };
-    try{ a.send(JSON.stringify({ ...start, playerNumber:1 })); }catch{}
-    try{ b.send(JSON.stringify({ ...start, playerNumber:2 })); }catch{}
-  }, 5000);
+  // server-driven countdown visible to both clients
+  startCountdown(id);
 }
 
 function destroyRoom(id){
   const room = rooms.get(id); if (!room) return;
+  if (room.countdownTimer) { clearInterval(room.countdownTimer); room.countdownTimer = null; }
   for (const ws of room.players) {
     const st = state.get(ws); if (st) { delete st.roomId; delete st.playerNumber; }
-    try{ ws.send(JSON.stringify({ type:'end' })); }catch{}
   }
   rooms.delete(id);
 }
@@ -147,10 +186,7 @@ function disconnect(ws){
   if (st?.roomId){
     const room = rooms.get(st.roomId);
     if (room){
-      for (const other of room.players) if (other!==ws && isOpen(other)) {
-        try{ other.send(JSON.stringify({ type:'opponentLeft' })); }catch{}
-      }
-      destroyRoom(st.roomId);
+      cancelCountdown(st.roomId, true); // also destroys the room
     }
   }
   state.delete(ws);
@@ -186,7 +222,7 @@ wss.on('connection', (ws) => {
         state.set(ws, st);
 
         addToWaiting(ws);
-        try{ ws.send(JSON.stringify({ type:'queued' })); }catch{}
+        send(ws, { type:'queued' });
         const pair = takePair();
         if (pair) createRoom(pair[0], pair[1]);
         break;
@@ -195,6 +231,8 @@ wss.on('connection', (ws) => {
       case 'makeMove': {
         if (!st.roomId) return;
         const room = rooms.get(st.roomId); if (!room) return;
+        // if countdown still exists, ignore moves
+        if (room.countdownValue != null) return;
         const sender = st.playerNumber === 1 ? 'Player 1' : 'Player 2';
         if (room.game.currentPlayer !== sender) return;
         const result = room.game.makeMove(data.col);
@@ -228,7 +266,7 @@ wss.on('connection', (ws) => {
         if (room.rematchVotes.size >= 2) {
           room.game = new ConnectFourGame();
           room.rematchVotes = new Set();
-          broadcast(room, { type: 'rematchStart' });
+          broadcast(room, { type:'rematchStart' });
         }
         break;
       }
@@ -237,13 +275,7 @@ wss.on('connection', (ws) => {
         waiting.delete(ws);
         const s = state.get(ws);
         if (s?.roomId) {
-          const room = rooms.get(s.roomId);
-          if (room) {
-            for (const other of room.players) if (other!==ws && isOpen(other)) {
-              try{ other.send(JSON.stringify({ type:'opponentLeft' })); }catch{}
-            }
-            destroyRoom(s.roomId);
-          }
+          cancelCountdown(s.roomId, true); // ends room + tells opponent
         }
         break;
       }
