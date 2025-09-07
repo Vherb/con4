@@ -87,45 +87,7 @@ function send(ws, payload){ if (isOpen(ws)) { try{ ws.send(JSON.stringify(payloa
 function broadcast(room, payload){ for (const ws of room.players) send(ws, payload); }
 
 /* ---------- Countdown lifecycle ---------- */
-function startCountdown(roomId){
-  const room = rooms.get(roomId);
-  if (!room) return;
-  room.countdownValue = 5;
-
-  // announce paired immediately
-  broadcast(room, { type:'paired', usernames: room.usernames, colors: room.colors });
-
-  // tick function
-  room.countdownTimer = setInterval(() => {
-    const r = rooms.get(roomId);
-    if (!r) return;
-    // if any player disconnected, cancel
-    const bothUp = r.players.every(isOpen);
-    if (!bothUp) { cancelCountdown(roomId, true); return; }
-
-    // broadcast current value and then decrement
-    sendCountdown(r);
-    r.countdownValue -= 1;
-
-    if (r.countdownValue <= 0) {
-      clearInterval(r.countdownTimer); r.countdownTimer = null;
-      // start the game
-      const start = {
-        type:'startGame',
-        currentPlayer: r.game.currentPlayer,
-        usernames: r.usernames,
-        colors: r.colors
-      };
-      const [a,b] = r.players;
-      send(a, { ...start, playerNumber:1 });
-      send(b, { ...start, playerNumber:2 });
-      r.countdownValue = null;
-    }
-  }, 1000);
-
-  // also send first tick right away (5)
-  sendCountdown(room);
-}
+// send one countdown tick (whatever value is current)
 function sendCountdown(room){
   if (room.countdownValue == null) return;
   broadcast(room, { type:'countdown', value: room.countdownValue });
@@ -136,10 +98,52 @@ function cancelCountdown(roomId, notifyOpponent){
   if (room.countdownTimer) { clearInterval(room.countdownTimer); room.countdownTimer = null; }
   room.countdownValue = null;
   if (notifyOpponent) {
-    // tell remaining player their opponent left and end room
     for (const ws of room.players) if (isOpen(ws)) send(ws, { type:'opponentLeft' });
   }
   destroyRoom(roomId);
+}
+function startCountdown(roomId){
+  const room = rooms.get(roomId);
+  if (!room) return;
+  room.countdownValue = 5;
+
+  // ⬇️ KEY CHANGE: send 'paired' individually with a per-client role flag
+  const [a,b] = room.players;
+  send(a, { type:'paired', you:1, usernames: room.usernames, colors: room.colors });
+  send(b, { type:'paired', you:2, usernames: room.usernames, colors: room.colors });
+
+  // also send the first tick right away (5)
+  sendCountdown(room);
+
+  room.countdownTimer = setInterval(() => {
+    const r = rooms.get(roomId);
+    if (!r) return;
+
+    // if anyone disconnected, cancel and inform the other
+    const bothUp = r.players.every(isOpen);
+    if (!bothUp) { cancelCountdown(roomId, true); return; }
+
+    // next tick
+    r.countdownValue -= 1;
+    if (r.countdownValue > 0) {
+      sendCountdown(r);
+      return;
+    }
+
+    // countdown reached 0 -> start game
+    clearInterval(r.countdownTimer);
+    r.countdownTimer = null;
+    r.countdownValue = null;
+
+    const start = {
+      type:'startGame',
+      currentPlayer: r.game.currentPlayer,
+      usernames: r.usernames,
+      colors: r.colors
+    };
+    send(a, { ...start, playerNumber:1 });
+    send(b, { ...start, playerNumber:2 });
+  }, 1000);
 }
 
 /* ---------- Room ---------- */
@@ -162,7 +166,14 @@ function createRoom(a,b){
   if (colB.toLowerCase() === colA.toLowerCase()) colB = pickAlternateColor(colA);
   const colors = { 'Player 1': colA, 'Player 2': colB };
 
-  rooms.set(id, { id, game, players:[a,b], colors, usernames, rematchVotes: new Set(), countdownTimer: null, countdownValue: null });
+  rooms.set(id, {
+    id, game,
+    players:[a,b],
+    colors, usernames,
+    rematchVotes: new Set(),
+    countdownTimer: null,
+    countdownValue: null
+  });
 
   state.set(a, { ...stA, roomId:id, playerNumber:1, alive:true });
   state.set(b, { ...stB, roomId:id, playerNumber:2, alive:true });
@@ -231,7 +242,7 @@ wss.on('connection', (ws) => {
       case 'makeMove': {
         if (!st.roomId) return;
         const room = rooms.get(st.roomId); if (!room) return;
-        // if countdown still exists, ignore moves
+        // ignore moves during countdown
         if (room.countdownValue != null) return;
         const sender = st.playerNumber === 1 ? 'Player 1' : 'Player 2';
         if (room.game.currentPlayer !== sender) return;
