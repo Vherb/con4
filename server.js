@@ -50,6 +50,17 @@ function pickAlternateColor(taken) {
   return palette.find(p => p.toLowerCase() !== t) || '#3b82f6';
 }
 
+/* ---------- Avatar helpers ---------- */
+const AVATAR_SET = [
+  'dragon','rocket','ninja','fox','octopus','ghost','robot','skull','wizard','thunder'
+];
+// validate to one of the presets; default to 'rocket'
+function normalizeAvatar(a) {
+  if (typeof a !== 'string') return 'rocket';
+  const key = a.trim().toLowerCase();
+  return AVATAR_SET.includes(key) ? key : 'rocket';
+}
+
 /* ---------- Server setup ---------- */
 const PORT = process.env.PORT || 3001;
 const app = express();
@@ -87,7 +98,49 @@ function send(ws, payload){ if (isOpen(ws)) { try{ ws.send(JSON.stringify(payloa
 function broadcast(room, payload){ for (const ws of room.players) send(ws, payload); }
 
 /* ---------- Countdown lifecycle ---------- */
-// send one countdown tick (whatever value is current)
+function startCountdown(roomId){
+  const room = rooms.get(roomId);
+  if (!room) return;
+  room.countdownValue = 5;
+
+  // announce paired immediately (usernames/colors/avatars)
+  broadcast(room, {
+    type:'paired',
+    usernames: room.usernames,
+    colors: room.colors,
+    avatars: room.avatars
+  });
+
+  // tick function
+  room.countdownTimer = setInterval(() => {
+    const r = rooms.get(roomId);
+    if (!r) return;
+    const bothUp = r.players.every(isOpen);
+    if (!bothUp) { cancelCountdown(roomId, true); return; }
+
+    sendCountdown(r);
+    r.countdownValue -= 1;
+
+    if (r.countdownValue <= 0) {
+      clearInterval(r.countdownTimer); r.countdownTimer = null;
+      // start the game
+      const start = {
+        type:'startGame',
+        currentPlayer: r.game.currentPlayer,
+        usernames: r.usernames,
+        colors: r.colors,
+        avatars: r.avatars
+      };
+      const [a,b] = r.players;
+      send(a, { ...start, playerNumber:1 });
+      send(b, { ...start, playerNumber:2 });
+      r.countdownValue = null;
+    }
+  }, 1000);
+
+  // also send first tick right away (5)
+  sendCountdown(room);
+}
 function sendCountdown(room){
   if (room.countdownValue == null) return;
   broadcast(room, { type:'countdown', value: room.countdownValue });
@@ -101,49 +154,6 @@ function cancelCountdown(roomId, notifyOpponent){
     for (const ws of room.players) if (isOpen(ws)) send(ws, { type:'opponentLeft' });
   }
   destroyRoom(roomId);
-}
-function startCountdown(roomId){
-  const room = rooms.get(roomId);
-  if (!room) return;
-  room.countdownValue = 5;
-
-  // ⬇️ KEY CHANGE: send 'paired' individually with a per-client role flag
-  const [a,b] = room.players;
-  send(a, { type:'paired', you:1, usernames: room.usernames, colors: room.colors });
-  send(b, { type:'paired', you:2, usernames: room.usernames, colors: room.colors });
-
-  // also send the first tick right away (5)
-  sendCountdown(room);
-
-  room.countdownTimer = setInterval(() => {
-    const r = rooms.get(roomId);
-    if (!r) return;
-
-    // if anyone disconnected, cancel and inform the other
-    const bothUp = r.players.every(isOpen);
-    if (!bothUp) { cancelCountdown(roomId, true); return; }
-
-    // next tick
-    r.countdownValue -= 1;
-    if (r.countdownValue > 0) {
-      sendCountdown(r);
-      return;
-    }
-
-    // countdown reached 0 -> start game
-    clearInterval(r.countdownTimer);
-    r.countdownTimer = null;
-    r.countdownValue = null;
-
-    const start = {
-      type:'startGame',
-      currentPlayer: r.game.currentPlayer,
-      usernames: r.usernames,
-      colors: r.colors
-    };
-    send(a, { ...start, playerNumber:1 });
-    send(b, { ...start, playerNumber:2 });
-  }, 1000);
 }
 
 /* ---------- Room ---------- */
@@ -166,19 +176,16 @@ function createRoom(a,b){
   if (colB.toLowerCase() === colA.toLowerCase()) colB = pickAlternateColor(colA);
   const colors = { 'Player 1': colA, 'Player 2': colB };
 
-  rooms.set(id, {
-    id, game,
-    players:[a,b],
-    colors, usernames,
-    rematchVotes: new Set(),
-    countdownTimer: null,
-    countdownValue: null
-  });
+  // avatars (from preset; default fallback)
+  const avA = normalizeAvatar(stA.desiredAvatar);
+  const avB = normalizeAvatar(stB.desiredAvatar);
+  const avatars = { 'Player 1': avA, 'Player 2': avB };
+
+  rooms.set(id, { id, game, players:[a,b], colors, usernames, avatars, rematchVotes: new Set(), countdownTimer: null, countdownValue: null });
 
   state.set(a, { ...stA, roomId:id, playerNumber:1, alive:true });
   state.set(b, { ...stB, roomId:id, playerNumber:2, alive:true });
 
-  // server-driven countdown visible to both clients
   startCountdown(id);
 }
 
@@ -195,10 +202,7 @@ function disconnect(ws){
   waiting.delete(ws);
   const st = state.get(ws);
   if (st?.roomId){
-    const room = rooms.get(st.roomId);
-    if (room){
-      cancelCountdown(st.roomId, true); // also destroys the room
-    }
+    cancelCountdown(st.roomId, true); // ends room + tells opponent
   }
   state.delete(ws);
 }
@@ -228,8 +232,10 @@ wss.on('connection', (ws) => {
         if (st.roomId) return;
         const username = (data.username || '').toString().slice(0, 40);
         const color = normalizeColor(data.color) || null;
+        const avatar = normalizeAvatar(data.avatar);
         st.username = username;
         st.desiredColor = color;
+        st.desiredAvatar = avatar;
         state.set(ws, st);
 
         addToWaiting(ws);
@@ -242,8 +248,7 @@ wss.on('connection', (ws) => {
       case 'makeMove': {
         if (!st.roomId) return;
         const room = rooms.get(st.roomId); if (!room) return;
-        // ignore moves during countdown
-        if (room.countdownValue != null) return;
+        if (room.countdownValue != null) return; // ignore moves during countdown
         const sender = st.playerNumber === 1 ? 'Player 1' : 'Player 2';
         if (room.game.currentPlayer !== sender) return;
         const result = room.game.makeMove(data.col);
