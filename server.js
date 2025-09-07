@@ -45,7 +45,7 @@ function normalizeColor(c) {
   return /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(s) ? s : null;
 }
 function pickAlternateColor(taken) {
-  const palette = ['#ef4444', '#3b82f6', '#22c55e', '#eab308', '#a855f7', '#f97316'];
+  const palette = ['#ef4444', '#3b82f6', '#22c55e', '#eab308', '#a855f7', '#f97316', '#111827'];
   const t = (taken || '').toLowerCase();
   return palette.find(p => p.toLowerCase() !== t) || '#3b82f6';
 }
@@ -84,11 +84,13 @@ function takePair(){
   waiting.delete(a); waiting.delete(b);
   return [a,b];
 }
+
 function broadcast(room, payload){
   const msg = JSON.stringify(payload);
   for (const ws of room.players) if (isOpen(ws)) { try{ ws.send(msg); }catch{} }
 }
-function createRoom(a,b, nameA=''){
+
+function createRoom(a,b){
   if (!isOpen(a)||!isOpen(b)||a===b) return;
   const id = nextRoomId++;
   const game = new ConnectFourGame();
@@ -96,23 +98,33 @@ function createRoom(a,b, nameA=''){
   const stA = state.get(a) || {};
   const stB = state.get(b) || {};
 
-  // Resolve distinct colors from player preferences
-  let colA = normalizeColor(stA.desiredColor) || '#ef4444';
-  let colB = normalizeColor(stB.desiredColor) || '#3b82f6';
-  if (colB.toLowerCase() === colA.toLowerCase()) colB = pickAlternateColor(colA);
+  // ----- Names (temporary usernames) -----
+  const nameA = (stA.username || 'Player 1').toString().slice(0, 40) || 'Player 1';
+  const nameB = (stB.username || 'Player 2').toString().slice(0, 40) || 'Player 2';
+  const usernames = { 'Player 1': nameA, 'Player 2': nameB };
 
+  // ----- Colors (guarantee distinct) -----
+  let colA = normalizeColor(stA.desiredColor) || '#ef4444'; // default P1 red
+  let colB = normalizeColor(stB.desiredColor) || '#3b82f6'; // default P2 blue
+  if (colB.toLowerCase() === colA.toLowerCase()) colB = pickAlternateColor(colA);
   const colors = { 'Player 1': colA, 'Player 2': colB };
 
-  rooms.set(id, { id, game, players:[a,b], colors, rematchVotes: new Set() });
+  rooms.set(id, { id, game, players:[a,b], colors, rematchVotes: new Set(), usernames });
 
   state.set(a, { ...stA, roomId:id, playerNumber:1, alive:true });
   state.set(b, { ...stB, roomId:id, playerNumber:2, alive:true });
 
-  const startA = { type:'startGame', currentPlayer:game.currentPlayer, playerNumber:1, username: stA.username || '', colors };
-  const startB = { type:'startGame', currentPlayer:game.currentPlayer, playerNumber:2, username: stB.username || '', colors };
-  try{ a.send(JSON.stringify(startA)); }catch{}
-  try{ b.send(JSON.stringify(startB)); }catch{}
+  const payload = {
+    type:'startGame',
+    currentPlayer: game.currentPlayer,
+    usernames,           // 👈 both names to both players
+    colors               // 👈 both colors to both players
+  };
+
+  try{ a.send(JSON.stringify({ ...payload, playerNumber:1 })); }catch{}
+  try{ b.send(JSON.stringify({ ...payload, playerNumber:2 })); }catch{}
 }
+
 function destroyRoom(id){
   const room = rooms.get(id); if (!room) return;
   for (const ws of room.players) {
@@ -121,6 +133,7 @@ function destroyRoom(id){
   }
   rooms.delete(id);
 }
+
 function disconnect(ws){
   waiting.delete(ws);
   const st = state.get(ws);
@@ -144,7 +157,6 @@ setInterval(() => {
     st.alive = true; state.set(ws, st);
     try{ ws.ping(); }catch{}
   }
-  // keep waiting set clean
   for (const ws of [...waiting]) if (!isOpen(ws)) waiting.delete(ws);
 }, 30000);
 
@@ -160,7 +172,7 @@ wss.on('connection', (ws) => {
     switch (data.type) {
       case 'joinGame': {
         if (st.roomId) return;
-        const username = (data.username || '').slice(0, 40);
+        const username = (data.username || '').toString().slice(0, 40);
         const color = normalizeColor(data.color) || null;
         st.username = username;
         st.desiredColor = color;
@@ -169,7 +181,7 @@ wss.on('connection', (ws) => {
         addToWaiting(ws);
         try{ ws.send(JSON.stringify({ type:'queued' })); }catch{}
         const pair = takePair();
-        if (pair) createRoom(pair[0], pair[1], (pair[0]===ws?username:''));
+        if (pair) createRoom(pair[0], pair[1]);
         break;
       }
 
@@ -211,6 +223,24 @@ wss.on('connection', (ws) => {
           room.game = new ConnectFourGame();
           room.rematchVotes = new Set();
           broadcast(room, { type: 'rematchStart' });
+        }
+        break;
+      }
+
+      /* Optional: allow renaming mid-match and broadcast to both players */
+      case 'updateName': {
+        const newName = (data.username || '').toString().slice(0, 40);
+        st.username = newName || '';
+        state.set(ws, st);
+        if (st.roomId) {
+          const room = rooms.get(st.roomId);
+          if (room) {
+            const names = { ...room.usernames };
+            const role = st.playerNumber === 1 ? 'Player 1' : 'Player 2';
+            names[role] = newName || (role === 'Player 1' ? 'Player 1' : 'Player 2');
+            room.usernames = names;
+            broadcast(room, { type:'usernames', usernames: names });
+          }
         }
         break;
       }
