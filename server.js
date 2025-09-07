@@ -55,11 +55,21 @@ const wss = new WebSocket.Server({ server });
 
 let nextRoomId = 1;
 const waiting = new Set();
-const rooms = new Map();
-const state = new WeakMap();
+const rooms = new Map();          // id -> { id, game, players:[wsA, wsB], rematch:Set<ws> }
+const state = new WeakMap();      // ws -> { alive, roomId?, playerNumber? }
+
 const isOpen = ws => ws && ws.readyState === WebSocket.OPEN;
 
-function addToWaiting(ws){ if (!isOpen(ws)) return false; waiting.add(ws); return true; }
+/* ---------- helpers ---------- */
+function send(ws, obj)      { if (isOpen(ws)) try { ws.send(JSON.stringify(obj)); } catch {} }
+function lobby(ws, status)  { send(ws, { type:'lobby', status }); }
+
+function addToWaiting(ws){
+  if (!isOpen(ws)) return false;
+  waiting.add(ws);
+  lobby(ws, 'queued');                  // <— client expects type:'lobby'
+  return true;
+}
 function takePair(){
   const live = [...waiting].filter(isOpen);
   if (live.length < 2) return null;
@@ -76,18 +86,24 @@ function createRoom(a,b, nameA=''){
   if (!isOpen(a)||!isOpen(b)||a===b) return;
   const id = nextRoomId++;
   const game = new ConnectFourGame();
-  rooms.set(id, { id, game, players:[a,b] });
+  const room = { id, game, players:[a,b], rematch: new Set() };
+  rooms.set(id, room);
   state.set(a, { roomId:id, playerNumber:1, alive:true });
   state.set(b, { roomId:id, playerNumber:2, alive:true });
 
-  try{ a.send(JSON.stringify({ type:'startGame', currentPlayer:game.currentPlayer, playerNumber:1, username:nameA })); }catch{}
-  try{ b.send(JSON.stringify({ type:'startGame', currentPlayer:game.currentPlayer, playerNumber:2, username:'' })); }catch{}
+  // clear lobby states for both
+  lobby(a, 'idle'); lobby(b, 'idle');
+
+  send(a, { type:'startGame', currentPlayer:game.currentPlayer, playerNumber:1, username:nameA || '' });
+  send(b, { type:'startGame', currentPlayer:game.currentPlayer, playerNumber:2, username:'' });
 }
 function destroyRoom(id){
   const room = rooms.get(id); if (!room) return;
   for (const ws of room.players) {
-    const st = state.get(ws); if (st) { delete st.roomId; delete st.playerNumber; }
-    try{ ws.send(JSON.stringify({ type:'end' })); }catch{}
+    const st = state.get(ws);
+    if (st) { delete st.roomId; delete st.playerNumber; }
+    send(ws, { type:'end' });
+    lobby(ws, 'idle');
   }
   rooms.delete(id);
 }
@@ -97,8 +113,9 @@ function disconnect(ws){
   if (st?.roomId){
     const room = rooms.get(st.roomId);
     if (room){
-      for (const other of room.players) if (other!==ws && isOpen(other)) {
-        try{ other.send(JSON.stringify({ type:'opponentLeft' })); }catch{}
+      for (const other of room.players) if (other!==ws) {
+        send(other, { type:'opponentLeft' });
+        // do NOT auto-waitlist the opponent; let the client click Join
       }
       destroyRoom(st.roomId);
     }
@@ -106,6 +123,7 @@ function disconnect(ws){
   state.delete(ws);
 }
 
+/* ---------- keepalive ---------- */
 setInterval(() => {
   for (const ws of wss.clients) {
     const st = state.get(ws) || {};
@@ -115,6 +133,7 @@ setInterval(() => {
   }
 }, 30000);
 
+/* ---------- websocket ---------- */
 wss.on('connection', (ws) => {
   state.set(ws, { alive:true });
   ws.on('pong', () => { const st = state.get(ws); if (st) st.alive = true; });
@@ -124,19 +143,21 @@ wss.on('connection', (ws) => {
     const st = state.get(ws) || {};
 
     switch (data.type) {
+      /* --- queue / matchmaking --- */
       case 'joinGame': {
-        if (st.roomId) return;
+        if (st.roomId) break;                  // already in a room
         addToWaiting(ws);
-        try{ ws.send(JSON.stringify({ type:'queued' })); }catch{}
         const pair = takePair();
         if (pair) createRoom(pair[0], pair[1], data.username || '');
         break;
       }
+
+      /* --- gameplay --- */
       case 'makeMove': {
-        if (!st.roomId) return;
-        const room = rooms.get(st.roomId); if (!room) return;
+        if (!st.roomId) break;
+        const room = rooms.get(st.roomId); if (!room) break;
         const sender = st.playerNumber === 1 ? 'Player 1' : 'Player 2';
-        if (room.game.currentPlayer !== sender) return;
+        if (room.game.currentPlayer !== sender) break;
         const ok = room.game.makeMove(data.col);
         if (ok) {
           broadcast(room, {
@@ -148,13 +169,54 @@ wss.on('connection', (ws) => {
         }
         break;
       }
-      case 'resetGame': {
-        if (!st.roomId) return;
-        const room = rooms.get(st.roomId); if (!room) return;
-        room.game = new ConnectFourGame();
-        broadcast(room, { type:'resetAck' });
+
+      /* --- explicit leave (end for both, but sockets stay up) --- */
+      case 'leaveGame': {
+        waiting.delete(ws);
+        if (!st.roomId) { lobby(ws,'idle'); break; }
+        const room = rooms.get(st.roomId);
+        if (room) {
+          for (const other of room.players) if (other !== ws) {
+            send(other, { type:'opponentLeft' });
+            lobby(other, 'idle');
+          }
+          destroyRoom(st.roomId);
+        }
+        lobby(ws, 'idle');
         break;
       }
+
+      /* --- hard reset by button (optional) -> start a fresh game immediately --- */
+      case 'resetGame': {
+        if (!st.roomId) break;
+        const room = rooms.get(st.roomId); if (!room) break;
+        room.game = new ConnectFourGame();
+        room.rematch.clear();
+        // Tell clients we’re starting again (client will reset UI on this)
+        broadcast(room, { type:'rematchStart' });
+        break;
+      }
+
+      /* --- rematch voting (support multiple names from various clients) --- */
+      case 'rematch':
+      case 'rematchVote':
+      case 'requestRematch': {
+        if (!st.roomId) break;
+        const room = rooms.get(st.roomId); if (!room) break;
+
+        room.rematch.add(ws);
+        const votes = Math.min(2, room.rematch.size);
+        broadcast(room, { type:'rematchStatus', votes }); // 0/2, 1/2, 2/2
+
+        if (room.rematch.size >= 2) {
+          // both voted: new game instance
+          room.game = new ConnectFourGame();
+          room.rematch.clear();
+          broadcast(room, { type:'rematchStart' });
+        }
+        break;
+      }
+
       default: break;
     }
   });
