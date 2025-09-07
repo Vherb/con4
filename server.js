@@ -75,7 +75,6 @@ const isOpen = ws => ws && ws.readyState === WebSocket.OPEN;
 /* ---------- Helpers ---------- */
 function addToWaiting(ws){ if (!isOpen(ws)) return false; waiting.add(ws); return true; }
 function takePair(){
-  // Purge closed sockets first
   for (const ws of [...waiting]) if (!isOpen(ws)) waiting.delete(ws);
   const live = [...waiting];
   if (live.length < 2) return null;
@@ -90,6 +89,7 @@ function broadcast(room, payload){
   for (const ws of room.players) if (isOpen(ws)) { try{ ws.send(msg); }catch{} }
 }
 
+/* ---------- NEW: paired preview then delayed start ---------- */
 function createRoom(a,b){
   if (!isOpen(a)||!isOpen(b)||a===b) return;
   const id = nextRoomId++;
@@ -98,14 +98,12 @@ function createRoom(a,b){
   const stA = state.get(a) || {};
   const stB = state.get(b) || {};
 
-  // ----- Names (temporary usernames) -----
   const nameA = (stA.username || 'Player 1').toString().slice(0, 40) || 'Player 1';
   const nameB = (stB.username || 'Player 2').toString().slice(0, 40) || 'Player 2';
   const usernames = { 'Player 1': nameA, 'Player 2': nameB };
 
-  // ----- Colors (guarantee distinct) -----
-  let colA = normalizeColor(stA.desiredColor) || '#ef4444'; // default P1 red
-  let colB = normalizeColor(stB.desiredColor) || '#3b82f6'; // default P2 blue
+  let colA = normalizeColor(stA.desiredColor) || '#ef4444';
+  let colB = normalizeColor(stB.desiredColor) || '#3b82f6';
   if (colB.toLowerCase() === colA.toLowerCase()) colB = pickAlternateColor(colA);
   const colors = { 'Player 1': colA, 'Player 2': colB };
 
@@ -114,15 +112,24 @@ function createRoom(a,b){
   state.set(a, { ...stA, roomId:id, playerNumber:1, alive:true });
   state.set(b, { ...stB, roomId:id, playerNumber:2, alive:true });
 
-  const payload = {
-    type:'startGame',
-    currentPlayer: game.currentPlayer,
-    usernames,           // 👈 both names to both players
-    colors               // 👈 both colors to both players
-  };
+  // 1) Send a PAIRING PREVIEW with both names/colors so the UI can show opponent + countdown
+  const pairedPayload = { type:'paired', usernames, colors };
+  try{ a.send(JSON.stringify(pairedPayload)); }catch{}
+  try{ b.send(JSON.stringify(pairedPayload)); }catch{}
 
-  try{ a.send(JSON.stringify({ ...payload, playerNumber:1 })); }catch{}
-  try{ b.send(JSON.stringify({ ...payload, playerNumber:2 })); }catch{}
+  // 2) After 5 seconds, actually start the game
+  setTimeout(() => {
+    const room = rooms.get(id);
+    if (!room) return;
+    const start = {
+      type:'startGame',
+      currentPlayer: room.game.currentPlayer,
+      usernames: room.usernames,
+      colors: room.colors
+    };
+    try{ a.send(JSON.stringify({ ...start, playerNumber:1 })); }catch{}
+    try{ b.send(JSON.stringify({ ...start, playerNumber:2 })); }catch{}
+  }, 5000);
 }
 
 function destroyRoom(id){
@@ -197,7 +204,7 @@ wss.on('connection', (ws) => {
             board: room.game.board,
             currentPlayer: room.game.currentPlayer,
             winner: room.game.winner || null,
-            lastMove: result // {row,col}
+            lastMove: result
           });
         }
         break;
@@ -212,7 +219,6 @@ wss.on('connection', (ws) => {
         break;
       }
 
-      /* ----- Simple rematch voting: 2/2 => new game ----- */
       case 'rematchVote': {
         if (!st.roomId) return;
         const room = rooms.get(st.roomId); if (!room) return;
@@ -227,25 +233,6 @@ wss.on('connection', (ws) => {
         break;
       }
 
-      /* Optional: allow renaming mid-match and broadcast to both players */
-      case 'updateName': {
-        const newName = (data.username || '').toString().slice(0, 40);
-        st.username = newName || '';
-        state.set(ws, st);
-        if (st.roomId) {
-          const room = rooms.get(st.roomId);
-          if (room) {
-            const names = { ...room.usernames };
-            const role = st.playerNumber === 1 ? 'Player 1' : 'Player 2';
-            names[role] = newName || (role === 'Player 1' ? 'Player 1' : 'Player 2');
-            room.usernames = names;
-            broadcast(room, { type:'usernames', usernames: names });
-          }
-        }
-        break;
-      }
-
-      /* Graceful leave */
       case 'leaveGame': {
         waiting.delete(ws);
         const s = state.get(ws);
