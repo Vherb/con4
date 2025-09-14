@@ -101,6 +101,17 @@ function takePair(){
   return [a,b];
 }
 
+/* ---------- Stakes helper ---------- */
+function stakesFor(room) {
+  const [a, b] = room.players;
+  const sa = state.get(a)?.stake;
+  const sb = state.get(b)?.stake;
+  return {
+    'Player 1': (typeof sa === 'number' ? sa : '—'),
+    'Player 2': (typeof sb === 'number' ? sb : '—'),
+  };
+}
+
 /* ---------- Countdown lifecycle ---------- */
 function startCountdown(roomId){
   const room = rooms.get(roomId);
@@ -113,6 +124,7 @@ function startCountdown(roomId){
     usernames: room.usernames,
     colors: room.colors,
     avatars: room.avatars,
+    stakes: stakesFor(room),   // include both bets at pairing time
     type: 'paired'
   };
   const [a,b] = room.players;
@@ -143,7 +155,8 @@ function startCountdown(roomId){
       currentPlayer: r.game.currentPlayer,
       usernames: r.usernames,
       colors: r.colors,
-      avatars: r.avatars
+      avatars: r.avatars,
+      stakes: stakesFor(r)   // also include stakes on start
     };
     const [sa,sb] = r.players;
     send(sa, { ...start, playerNumber:1 });
@@ -185,7 +198,7 @@ function createRoom(a,b){
   if (colB.toLowerCase() === colA.toLowerCase()) colB = pickAlternateColor(colA);
   const colors = { 'Player 1': colA, 'Player 2': colB };
 
-  // avatars (as chosen; no constraints)
+  // avatars
   const avA = normalizeAvatar(stA.avatar) || 'rocket';
   const avB = normalizeAvatar(stB.avatar) || 'alien';
   const avatars = { 'Player 1': avA, 'Player 2': avB };
@@ -250,9 +263,16 @@ wss.on('connection', (ws) => {
         const color = normalizeColor(data.color) || null;
         const avatar = normalizeAvatar(data.avatar) || null;
 
+        // NEW: read stake (number) from client if provided
+        let stake = null;
+        if (typeof data.stake === 'number' && isFinite(data.stake)) {
+          stake = Math.max(0.01, Number(data.stake));
+        }
+
         st.username = username;
         st.desiredColor = color;
         st.avatar = avatar;
+        st.stake = stake; // save intended stake
         state.set(ws, st);
 
         addToWaiting(ws);
@@ -294,9 +314,19 @@ wss.on('connection', (ws) => {
       case 'rematchVote': {
         if (!st.roomId) return;
         const room = rooms.get(st.roomId); if (!room) return;
+
+        // Allow updating stake for the next round
+        if (typeof data.stake === 'number' && isFinite(data.stake)) {
+          st.stake = Math.max(0.01, Number(data.stake));
+          state.set(ws, st);
+          // push updated stakes to both clients immediately
+          broadcast(room, { type: 'stakes', stakes: stakesFor(room) });
+        }
+
         if (!room.rematchVotes) room.rematchVotes = new Set();
         room.rematchVotes.add(st.playerNumber);
         broadcast(room, { type:'rematchUpdate', count: room.rematchVotes.size });
+
         if (room.rematchVotes.size >= 2) {
           room.game = new ConnectFourGame();
           room.rematchVotes = new Set();
